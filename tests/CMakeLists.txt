@@ -13,6 +13,7 @@ FetchContent_MakeAvailable(googletest)
 add_executable(vibe_tests
     common/diagnostics_test.cpp
     lexer/keyword_trie_test.cpp
+    lexer/lexer_grammar_examples_test.cpp
     lexer/lexer_number_test.cpp
     lexer/lexer_prompt_test.cpp
     lexer/lexer_test.cpp
