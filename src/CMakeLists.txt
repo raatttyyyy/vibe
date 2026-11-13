@@ -10,3 +10,6 @@ add_library(vibe_lexer
     lexer/token.cpp
 )
 target_link_libraries(vibe_lexer PUBLIC vibe_common PRIVATE vibe_warnings)
+
+add_executable(vibe-lex tools/vibe_lex.cpp)
+target_link_libraries(vibe-lex PRIVATE vibe_lexer vibe_warnings)
