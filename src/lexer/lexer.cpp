@@ -12,7 +12,10 @@ namespace {
 
 constexpr std::string_view kInvalidCharacter = "LEX001";
 constexpr std::string_view kIncompleteOperator = "LEX002";
+constexpr std::string_view kMalformedNumber = "LEX003";
 constexpr std::string_view kUnclosedComment = "LEX008";
+
+constexpr std::string_view kUnits[] = {"usd", "tok", "ktok", "s", "min"};
 
 bool isDigit(char c) { return c >= '0' && c <= '9'; }
 bool isLetter(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
@@ -104,6 +107,13 @@ std::string printable(std::string_view text) {
 
 std::string quoted(std::string_view text) {
     return "'" + printable(text) + "'";
+}
+
+bool isUnit(std::string_view suffix) {
+    for (std::string_view unit : kUnits) {
+        if (suffix == unit) return true;
+    }
+    return false;
 }
 
 // Конечный автомат, закодированный переходами в коде: начальное состояние —
@@ -223,6 +233,10 @@ private:
             scanWord();
             return;
         }
+        if (isDigit(c)) {
+            scanNumber();
+            return;
+        }
         switch (c) {
             case '(': case ')': case '[': case ']': case '{': case '}':
             case ';': case ':': case '.':
@@ -278,6 +292,103 @@ private:
             advance();
         }
         emit(trie.isWord(state) ? TokenType::Keyword : TokenType::Identifier);
+    }
+
+    enum class NumberState {
+        Integer,       // 12
+        Fraction,      // 12.5
+        ExponentMark,  // 12e
+        ExponentSign,  // 12e-
+        Exponent,      // 12e-3
+        Suffix,        // 12usd
+        Malformed,     // 3.5.7, 35k6: дочитывается весь ошибочный фрагмент
+    };
+
+    // INT, DOUBLE и UNIT. Точка без следующей цифры остаётся разделителем.
+    void scanNumber() {
+        NumberState state = NumberState::Integer;
+        LiteralKind kind = LiteralKind::Int;
+        std::size_t suffixBegin = 0;
+        char exponentMark = 'e';
+        std::string reason;
+
+        while (true) {
+            const char c = peek();
+            const bool dotThenDigit = c == '.' && isDigit(peek(1));
+            switch (state) {
+                case NumberState::Integer:
+                case NumberState::Fraction:
+                case NumberState::Exponent:
+                    if (isDigit(c)) {
+                        advance();
+                    } else if (dotThenDigit && state == NumberState::Integer) {
+                        advance();
+                        kind = LiteralKind::Double;
+                        state = NumberState::Fraction;
+                    } else if (dotThenDigit) {
+                        reason = state == NumberState::Fraction
+                                     ? "после дробной части ожидался конец числа, встретилась "
+                                       "вторая точка"
+                                     : "порядок должен быть целым, встретилась точка";
+                        state = NumberState::Malformed;
+                    } else if ((c == 'e' || c == 'E') && state != NumberState::Exponent) {
+                        exponentMark = c;
+                        advance();
+                        kind = LiteralKind::Double;
+                        state = NumberState::ExponentMark;
+                    } else if (isIdentifierStart(c)) {
+                        suffixBegin = pos_.offset;
+                        state = NumberState::Suffix;
+                    } else {
+                        emit(TokenType::Literal, kind);
+                        return;
+                    }
+                    break;
+
+                case NumberState::ExponentMark:
+                case NumberState::ExponentSign:
+                    if (isDigit(c)) {
+                        state = NumberState::Exponent;
+                    } else if ((c == '+' || c == '-') && state == NumberState::ExponentMark) {
+                        advance();
+                        state = NumberState::ExponentSign;
+                    } else {
+                        reason = "после " + quoted(std::string(1, exponentMark)) +
+                                 " ожидались цифры порядка";
+                        state = NumberState::Malformed;
+                    }
+                    break;
+
+                case NumberState::Suffix: {
+                    while (isIdentifierChar(peek())) {
+                        advance();
+                    }
+                    const std::string_view suffix =
+                        source_.substr(suffixBegin, pos_.offset - suffixBegin);
+                    if (!isUnit(suffix)) {
+                        reason = "ожидалась единица usd, tok, ktok, s или min, встретилось " +
+                                 quoted(suffix);
+                        state = NumberState::Malformed;
+                    } else if (peek() == '.' && isDigit(peek(1))) {
+                        reason = "после единицы ожидался конец числа, встретилась точка";
+                        state = NumberState::Malformed;
+                    } else {
+                        emit(TokenType::Literal, LiteralKind::Unit);
+                        return;
+                    }
+                    break;
+                }
+
+                case NumberState::Malformed:
+                    if (isIdentifierChar(c) || dotThenDigit) {
+                        advance();
+                        break;
+                    }
+                    emitUnknown(kMalformedNumber, "неверно записанное число " +
+                                                      quoted(currentText()) + ": " + reason);
+                    return;
+            }
+        }
     }
 
     // Подряд идущие недопустимые символы дают одну лексему Unknown.
