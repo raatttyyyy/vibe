@@ -15,6 +15,7 @@ add_executable(vibe_tests
     lexer/keyword_trie_test.cpp
     lexer/lexer_number_test.cpp
     lexer/lexer_test.cpp
+    lexer/lexer_text_test.cpp
     lexer/token_test.cpp
 )
 target_link_libraries(vibe_tests PRIVATE vibe_lexer vibe_warnings GTest::gtest_main)

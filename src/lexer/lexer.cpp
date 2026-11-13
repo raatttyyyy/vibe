@@ -13,6 +13,10 @@ namespace {
 constexpr std::string_view kInvalidCharacter = "LEX001";
 constexpr std::string_view kIncompleteOperator = "LEX002";
 constexpr std::string_view kMalformedNumber = "LEX003";
+constexpr std::string_view kUnclosedString = "LEX004";
+constexpr std::string_view kUnclosedChar = "LEX005";
+constexpr std::string_view kCharLength = "LEX006";
+constexpr std::string_view kInvalidEscape = "LEX007";
 constexpr std::string_view kUnclosedComment = "LEX008";
 
 constexpr std::string_view kUnits[] = {"usd", "tok", "ktok", "s", "min"};
@@ -255,6 +259,8 @@ private:
             case '>': scanOperator('='); return;
             case '&': scanDoubledOperator('&'); return;
             case '|': scanDoubledOperator('|'); return;
+            case '\'': scanQuoted('\''); return;
+            case '"': scanQuoted('"'); return;
             default:
                 scanInvalidCharacters();
                 return;
@@ -388,6 +394,64 @@ private:
                                                       quoted(currentText()) + ": " + reason);
                     return;
             }
+        }
+    }
+
+    // CHAR в '...' и STRING в "...". Допустимы \n \r \t \\ и своя кавычка; перевод строки
+    // внутри запрещён. Если ошибок несколько, сообщается первая по важности:
+    // незакрытый литерал, затем escape-последовательность, затем длина CHAR.
+    void scanQuoted(char quote) {
+        const bool isChar = quote == '\'';
+        advance();
+
+        std::size_t characters = 0;
+        std::string badEscape;
+        while (true) {
+            if (atEnd() || isLineBreak(peek())) {
+                const std::string found = atEnd() ? "конец файла" : "перевод строки";
+                if (isChar) {
+                    emitUnknown(kUnclosedChar,
+                                "незакрытый символьный литерал: ожидалась закрывающая ', "
+                                "встретился " + found);
+                } else {
+                    emitUnknown(kUnclosedString,
+                                "незакрытая строка: ожидалась закрывающая \", встретился " + found);
+                }
+                return;
+            }
+            const char c = peek();
+            if (c == quote) {
+                advance();
+                break;
+            }
+            ++characters;
+            if (c != '\\') {
+                advance();
+                continue;
+            }
+            const std::size_t escapeBegin = pos_.offset;
+            advance();
+            if (atEnd() || isLineBreak(peek())) {
+                continue;
+            }
+            const char e = peek();
+            advance();
+            const bool valid = e == 'n' || e == 'r' || e == 't' || e == '\\' || e == quote;
+            if (!valid && badEscape.empty()) {
+                badEscape = source_.substr(escapeBegin, pos_.offset - escapeBegin);
+            }
+        }
+
+        if (!badEscape.empty()) {
+            emitUnknown(kInvalidEscape, "недопустимая escape-последовательность " +
+                                            quoted(badEscape) + ": ожидалось \\n, \\r, \\t, \\\\ или \\" +
+                                            std::string(1, quote));
+        } else if (isChar && characters != 1) {
+            emitUnknown(kCharLength,
+                        "символьный литерал: ожидался ровно один символ, встретилось символов: " +
+                            std::to_string(characters));
+        } else {
+            emit(TokenType::Literal, isChar ? LiteralKind::Char : LiteralKind::String);
         }
     }
 
