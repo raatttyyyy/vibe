@@ -6,6 +6,7 @@ target_link_libraries(vibe_common PRIVATE vibe_warnings)
 
 add_library(vibe_lexer
     lexer/keyword_trie.cpp
+    lexer/lexer.cpp
     lexer/token.cpp
 )
 target_link_libraries(vibe_lexer PUBLIC vibe_common PRIVATE vibe_warnings)

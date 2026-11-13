@@ -13,6 +13,7 @@ FetchContent_MakeAvailable(googletest)
 add_executable(vibe_tests
     common/diagnostics_test.cpp
     lexer/keyword_trie_test.cpp
+    lexer/lexer_test.cpp
     lexer/token_test.cpp
 )
 target_link_libraries(vibe_tests PRIVATE vibe_lexer vibe_warnings GTest::gtest_main)
