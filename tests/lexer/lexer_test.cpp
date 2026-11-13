@@ -250,6 +250,13 @@ TEST(LexInvalidCharacter, OtherWhitespaceIsInvalid) {
     EXPECT_EQ(result.diags.all()[0].message, "недопустимый символ '\\x0C'");
 }
 
+TEST(LexInvalidCharacter, ByteOrderMarkIsNotSkipped) {
+    const auto result = lex("\xEF\xBB\xBFx");
+    EXPECT_EQ(dump(result.tokens), "UNKNOWN(\xEF\xBB\xBF) ID(x) EOF");
+    EXPECT_EQ(codes(result.diags), Codes{"LEX001"});
+    EXPECT_EQ(result.tokens[1].range.begin.column, 2u);
+}
+
 TEST(LexInvalidCharacter, ContinuesToEndOfFile) {
     const auto result = lex("# a\n? b\n~");
     EXPECT_EQ(dump(result.tokens), "UNKNOWN(#) ID(a) UNKNOWN(?) ID(b) UNKNOWN(~) EOF");
