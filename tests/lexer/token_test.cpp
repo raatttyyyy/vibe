@@ -27,7 +27,7 @@ TEST(LiteralKind, NamesAllKinds) {
 }
 
 TEST(Token, LiteralKindDefaultsToNone) {
-    Token token{.type = TokenType::Identifier, .lexeme = "a"};
+    Token token{.type = TokenType::Identifier, .lexeme = "a", .range = {}};
     EXPECT_EQ(token.literal, LiteralKind::None);
 }
 

@@ -136,7 +136,7 @@ public:
             scanToken();
         }
         reportUnclosedSubstitutions();
-        tokens_.push_back(Token{.type = TokenType::EndOfFile, .range = {pos_, pos_}});
+        tokens_.push_back(Token{.type = TokenType::EndOfFile, .lexeme = {}, .range = {pos_, pos_}});
         return std::move(tokens_);
     }
 
