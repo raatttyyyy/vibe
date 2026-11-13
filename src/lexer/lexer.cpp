@@ -18,6 +18,8 @@ constexpr std::string_view kUnclosedChar = "LEX005";
 constexpr std::string_view kCharLength = "LEX006";
 constexpr std::string_view kInvalidEscape = "LEX007";
 constexpr std::string_view kUnclosedComment = "LEX008";
+constexpr std::string_view kUnclosedPrompt = "LEX009";
+constexpr std::string_view kUnclosedSubstitution = "LEX010";
 
 constexpr std::string_view kUnits[] = {"usd", "tok", "ktok", "s", "min"};
 
@@ -133,11 +135,18 @@ public:
             if (atEnd()) break;
             scanToken();
         }
+        reportUnclosedSubstitutions();
         tokens_.push_back(Token{.type = TokenType::EndOfFile, .range = {pos_, pos_}});
         return std::move(tokens_);
     }
 
 private:
+    // Открытая подстановка ${ ... } внутри промпта (LEX-10).
+    struct Substitution {
+        std::size_t opener;          // индекс лексемы PROMPT_HEAD или PROMPT_MID
+        std::size_t braceDepth = 0;  // незакрытые { внутри подстановки
+    };
+
     bool atEnd() const { return pos_.offset >= source_.size(); }
 
     char peek(std::size_t ahead = 0) const {
@@ -242,7 +251,26 @@ private:
             return;
         }
         switch (c) {
-            case '(': case ')': case '[': case ']': case '{': case '}':
+            case '{':
+                if (!substitutions_.empty()) {
+                    ++substitutions_.back().braceDepth;
+                }
+                advance();
+                emit(TokenType::Delimiter);
+                return;
+            case '}':
+                if (!substitutions_.empty()) {
+                    if (substitutions_.back().braceDepth == 0) {
+                        substitutions_.pop_back();
+                        scanPromptText();
+                        return;
+                    }
+                    --substitutions_.back().braceDepth;
+                }
+                advance();
+                emit(TokenType::Delimiter);
+                return;
+            case '(': case ')': case '[': case ']':
             case ';': case ':': case '.':
                 advance();
                 emit(TokenType::Delimiter);
@@ -261,6 +289,7 @@ private:
             case '|': scanDoubledOperator('|'); return;
             case '\'': scanQuoted('\''); return;
             case '"': scanQuoted('"'); return;
+            case '`': scanPromptText(); return;
             default:
                 scanInvalidCharacters();
                 return;
@@ -455,6 +484,71 @@ private:
         }
     }
 
+    // Текстовая часть промпта от ` или от } закрытой подстановки до ` (PROMPT_FULL или
+    // PROMPT_TAIL) или до ${ включительно (PROMPT_HEAD или PROMPT_MID), после которого лексер
+    // возвращается к обычным лексемам. Переводы строки в тексте допустимы; экранируются
+    // только \`, \\ и \${.
+    void scanPromptText() {
+        advance();
+        std::string badEscape;
+        while (!atEnd()) {
+            const char c = peek();
+            if (c == '`') {
+                advance();
+                finishPromptPart(badEscape);
+                return;
+            }
+            if (c == '$' && peek(1) == '{') {
+                advance();
+                advance();
+                finishPromptPart(badEscape);
+                substitutions_.push_back(Substitution{.opener = tokens_.size() - 1});
+                return;
+            }
+            if (c != '\\') {
+                advance();
+                continue;
+            }
+            const std::size_t escapeBegin = pos_.offset;
+            advance();
+            if (peek() == '`' || peek() == '\\') {
+                advance();
+            } else if (peek() == '$' && peek(1) == '{') {
+                advance();
+                advance();
+            } else if (!atEnd()) {
+                advance();
+                if (badEscape.empty()) {
+                    badEscape = source_.substr(escapeBegin, pos_.offset - escapeBegin);
+                }
+            }
+        }
+        emitUnknown(kUnclosedPrompt,
+                    "незакрытый промпт: ожидалась закрывающая `, встретился конец файла");
+    }
+
+    void finishPromptPart(const std::string& badEscape) {
+        if (badEscape.empty()) {
+            emit(TokenType::Literal, LiteralKind::Prompt);
+            return;
+        }
+        emitUnknown(kInvalidEscape, "недопустимая escape-последовательность " +
+                                        quoted(badEscape) + ": ожидалось \\`, \\\\ или \\${");
+    }
+
+    // Подстановка, не закрытая до конца файла, делает ошибочной открывшую её лексему.
+    void reportUnclosedSubstitutions() {
+        for (const Substitution& substitution : substitutions_) {
+            Token& opener = tokens_[substitution.opener];
+            opener.type = TokenType::Unknown;
+            opener.literal = LiteralKind::None;
+            reportError(kUnclosedSubstitution,
+                        "незакрытая подстановка в промпте: ожидалась '}', встретился конец файла",
+                        opener.range);
+        }
+        substitutions_.clear();
+    }
+
     // Подряд идущие недопустимые символы дают одну лексему Unknown.
     void scanInvalidCharacters() {
         std::size_t count = 0;
@@ -472,6 +566,7 @@ private:
     SourcePos pos_;
     SourcePos start_;
     std::vector<Token> tokens_;
+    std::vector<Substitution> substitutions_;
 };
 
 }  // namespace
