@@ -86,45 +86,51 @@ Vibe — рабочее название языка программирован
 
 ### 3.4. Как это выглядит
 
-Пример показывает замысел. Точный синтаксис задаёт грамматика в `docs/grammar/`, и он может отличаться.
+Пример использует синтаксис [агентной части грамматики](grammar/Vibe_grammar.md). Сигнатуры импортированных модулей и типы `Patch` и `CiRun` определяет библиотека исполнения.
 
-```
+```vibe
+import fs;
+import sh;
+import ci;
+import gh;
+
 struct Verdict { bool ok; string reason; }
-
-model fast   { id: "small-model"; }
+model fast { id: "small-model"; }
 model strong { id: "large-model"; }
 
 agent Fixer {
-    model:  fast else strong;
-    tools:  (fs.read("**"), fs.write("src/**"), sh.run("npm test"));
-    budget: 2usd, 20min;
-    space:  worktree;
+    model: fast else strong;
+    tools: (fs.read("AGENTS.md"), fs.write("src/**"), sh.command("npm test"));
+    budget: 2usd, 20min, 8ktok;
+    space: worktree;
 }
-
 agent Judge {
     model: strong;
-    tools: (fs.read("**"));
+    tools: (fs.read("AGENTS.md"), fs.read("src/**"));
+    budget: 1usd, 2min, 4ktok;
 }
 
 task Patch fix(CiRun run) {
     context {
         use fs.file("AGENTS.md");
-        use run.log.tail(200);
-
+        use run.log;
         attempt (3) {
-            Patch p = Fixer.ask(`CI упал на шаге ${run.step}. Найди причину и исправь.`);
-            ensure sh.run("npm test").ok : "тесты не проходят";
-            Verdict v = Judge.ask(`Оцени патч: ${p.diff}`);
-            ensure v.ok : v.reason;
-            return p;
+            Patch patch = ask<Patch>(Fixer, `Исправь сбой на шаге ${run.step}.`);
+            ensure sh.run("npm test").ok : "Тесты не прошли";
+            context {
+                hide run.log;
+                Verdict result = ask<Verdict>(Judge, `Оцени патч ${patch.diff}.`);
+                ensure result.ok : result.reason;
+            }
+            return patch;
         }
     }
 }
 
 on ci.failed(CiRun run) {
-    future<Patch> f = spawn fix(run);
-    Patch p = await f;
-    gh.open_pr(p);
+    future<Patch> pending = spawn fix(run);
+    Patch patch = await pending;
+    gh.open_pr(patch);
 }
 ```
 
