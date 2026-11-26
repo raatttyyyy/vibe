@@ -1,7 +1,7 @@
 #pragma once
 
-#include <array>
 #include <cstdint>
+#include <map>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -28,13 +28,9 @@ public:
     bool contains(std::string_view word) const;
 
 private:
-    static constexpr std::size_t kAlphabetSize = 26 + 26 + 10 + 1;
-
     struct Node {
-        std::array<State, kAlphabetSize> children;
+        std::map<char, State> children;
         bool isWord = false;
-
-        Node() { children.fill(kDead); }
     };
 
     std::vector<Node> nodes_;

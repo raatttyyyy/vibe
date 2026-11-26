@@ -3,16 +3,10 @@
 #include <stdexcept>
 #include <string>
 
+#include "lexer/identifier_chars.h"
+
 namespace vibe {
 namespace {
-
-int alphabetIndex(char c) {
-    if (c >= 'a' && c <= 'z') return c - 'a';
-    if (c >= 'A' && c <= 'Z') return 26 + (c - 'A');
-    if (c >= '0' && c <= '9') return 52 + (c - '0');
-    if (c == '_') return 62;
-    return -1;
-}
 
 constexpr std::string_view kKeywords[] = {
     "import", "func", "struct", "enum", "void", "int", "double", "bool", "char", "string",
@@ -39,16 +33,15 @@ void KeywordTrie::insert(std::string_view word) {
     }
     State state = kRoot;
     for (char c : word) {
-        const int index = alphabetIndex(c);
-        if (index < 0) {
+        if (!isIdentifierChar(c)) {
             throw std::invalid_argument("keyword has a character outside [A-Za-z0-9_]: " +
                                         std::string(word));
         }
-        State child = nodes_[state].children[index];
+        State child = next(state, c);
         if (child == kDead) {
             child = static_cast<State>(nodes_.size());
-            nodes_[state].children[index] = child;
             nodes_.emplace_back();
+            nodes_[state].children.emplace(c, child);
         }
         state = child;
     }
@@ -57,9 +50,9 @@ void KeywordTrie::insert(std::string_view word) {
 
 KeywordTrie::State KeywordTrie::next(State state, char c) const {
     if (state == kDead) return kDead;
-    const int index = alphabetIndex(c);
-    if (index < 0) return kDead;
-    return nodes_[state].children[index];
+    const auto& children = nodes_[state].children;
+    const auto it = children.find(c);
+    return it == children.end() ? kDead : it->second;
 }
 
 bool KeywordTrie::isWord(State state) const {

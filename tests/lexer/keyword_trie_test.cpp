@@ -68,10 +68,13 @@ TEST(KeywordTrie, DeadStateIsAbsorbing) {
 }
 
 TEST(KeywordTrie, CustomWords) {
-    const std::string_view words[] = {"ab", "abc"};
+    const std::string_view words[] = {"ab", "abc", "ab_C9"};
     KeywordTrie trie(words);
     EXPECT_TRUE(trie.contains("ab"));
     EXPECT_TRUE(trie.contains("abc"));
+    EXPECT_TRUE(trie.contains("ab_C9"));
+    EXPECT_FALSE(trie.contains("ab_c9"));
+    EXPECT_FALSE(trie.contains("ab_C"));
     EXPECT_FALSE(trie.contains("a"));
     EXPECT_FALSE(trie.contains("abcd"));
 }
