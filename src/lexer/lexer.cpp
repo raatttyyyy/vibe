@@ -1,0 +1,546 @@
+#include "lexer/lexer.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <utility>
+
+#include "lexer/identifier_chars.h"
+#include "lexer/keyword_trie.h"
+
+namespace vibe {
+namespace {
+
+constexpr std::string_view kInvalidCharacter = "LEX001";
+constexpr std::string_view kIncompleteOperator = "LEX002";
+constexpr std::string_view kMalformedNumber = "LEX003";
+constexpr std::string_view kUnclosedString = "LEX004";
+constexpr std::string_view kUnclosedChar = "LEX005";
+constexpr std::string_view kCharLength = "LEX006";
+constexpr std::string_view kInvalidEscape = "LEX007";
+constexpr std::string_view kUnclosedComment = "LEX008";
+constexpr std::string_view kUnclosedPrompt = "LEX009";
+constexpr std::string_view kUnclosedSubstitution = "LEX010";
+
+constexpr std::string_view kUnits[] = {"usd", "tok", "ktok", "s", "min"};
+
+bool isLineBreak(char c) { return c == '\n' || c == '\r'; }
+bool isWhitespace(char c) { return c == ' ' || c == '\t' || isLineBreak(c); }
+
+bool startsToken(char c) {
+    if (isIdentifierChar(c)) return true;
+    switch (c) {
+        case '(': case ')': case '[': case ']': case '{': case '}':
+        case ';': case ':': case '.':
+        case '+': case '-': case '*': case '/': case '%': case '=': case '!':
+        case '<': case '>': case '&': case '|': case ',':
+        case '\'': case '"': case '`':
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Длина корректной последовательности UTF-8 в text[i], 0 — если она испорчена.
+std::size_t utf8SequenceLength(std::string_view text, std::size_t i) {
+    const auto byte = [&](std::size_t k) { return static_cast<unsigned char>(text[k]); };
+    const unsigned char lead = byte(i);
+    if (lead < 0x80) return 1;
+
+    std::size_t length = 0;
+    unsigned char low = 0x80;
+    unsigned char high = 0xBF;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        length = 2;
+    } else if (lead == 0xE0) {
+        length = 3;
+        low = 0xA0;
+    } else if ((lead >= 0xE1 && lead <= 0xEC) || lead == 0xEE || lead == 0xEF) {
+        length = 3;
+    } else if (lead == 0xED) {
+        length = 3;
+        high = 0x9F;
+    } else if (lead == 0xF0) {
+        length = 4;
+        low = 0x90;
+    } else if (lead >= 0xF1 && lead <= 0xF3) {
+        length = 4;
+    } else if (lead == 0xF4) {
+        length = 4;
+        high = 0x8F;
+    } else {
+        return 0;
+    }
+
+    if (i + length > text.size()) return 0;
+    if (byte(i + 1) < low || byte(i + 1) > high) return 0;
+    for (std::size_t k = 2; k < length; ++k) {
+        if (byte(i + k) < 0x80 || byte(i + k) > 0xBF) return 0;
+    }
+    return length;
+}
+
+// Текст для сообщения: управляющие символы и испорченный UTF-8 записываются как \xNN.
+std::string printable(std::string_view text) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const auto c = static_cast<unsigned char>(text[i]);
+        const std::size_t length = utf8SequenceLength(text, i);
+        if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else if (c == '\t') {
+            out += "\\t";
+        } else if (length == 0 || c < 0x20 || c == 0x7F) {
+            out += "\\x";
+            out += kHex[c >> 4];
+            out += kHex[c & 0xF];
+        } else {
+            out.append(text.substr(i, length));
+            i += length;
+            continue;
+        }
+        ++i;
+    }
+    return out;
+}
+
+std::string quoted(std::string_view text) {
+    return "'" + printable(text) + "'";
+}
+
+bool isUnit(std::string_view suffix) {
+    for (std::string_view unit : kUnits) {
+        if (suffix == unit) return true;
+    }
+    return false;
+}
+
+// Конечный автомат, закодированный переходами в коде: начальное состояние —
+// scanToken(), который по первому символу выбирает ветку автомата. Позиция только растёт,
+// а заглядывание вперёд ограничено двумя символами, поэтому время линейно (LEX-2).
+// Описание автомата и кодов ошибок — docs/analysis/lexer.md.
+class Lexer {
+public:
+    Lexer(std::string_view source, DiagnosticSink& diags) : source_(source), diags_(diags) {}
+
+    std::vector<Token> run() {
+        while (true) {
+            skipWhitespaceAndComments();
+            if (atEnd()) break;
+            scanToken();
+        }
+        reportUnclosedSubstitutions();
+        tokens_.push_back(Token{.type = TokenType::EndOfFile, .lexeme = {}, .range = {pos_, pos_}});
+        return std::move(tokens_);
+    }
+
+private:
+    // Открытая подстановка ${ ... } внутри промпта (LEX-10).
+    struct Substitution {
+        std::size_t opener;          // индекс лексемы PROMPT_HEAD или PROMPT_MID
+        std::size_t braceDepth = 0;  // незакрытые { внутри подстановки
+    };
+
+    bool atEnd() const { return pos_.offset >= source_.size(); }
+
+    char peek(std::size_t ahead = 0) const {
+        const std::size_t i = pos_.offset + ahead;
+        return i < source_.size() ? source_[i] : '\0';
+    }
+
+    // Переходит через один символ: код Unicode, испорченный байт или перевод строки (CRLF — один).
+    void advance() {
+        const char c = source_[pos_.offset];
+        if (isLineBreak(c)) {
+            ++pos_.offset;
+            if (c == '\r' && !atEnd() && source_[pos_.offset] == '\n') {
+                ++pos_.offset;
+            }
+            ++pos_.line;
+            pos_.column = 1;
+            return;
+        }
+        const std::size_t length = utf8SequenceLength(source_, pos_.offset);
+        pos_.offset += static_cast<std::uint32_t>(length == 0 ? 1 : length);
+        ++pos_.column;
+    }
+
+    void beginToken() { start_ = pos_; }
+
+    std::string_view currentText() const {
+        return source_.substr(start_.offset, pos_.offset - start_.offset);
+    }
+
+    Token& emit(TokenType type, LiteralKind literal = LiteralKind::None) {
+        tokens_.push_back(Token{
+            .type = type,
+            .literal = literal,
+            .lexeme = std::string(currentText()),
+            .range = {start_, pos_},
+        });
+        return tokens_.back();
+    }
+
+    void emitUnknown(std::string_view code, std::string message) {
+        const SourceRange range = emit(TokenType::Unknown).range;
+        reportError(code, std::move(message), range);
+    }
+
+    void reportError(std::string_view code, std::string message, SourceRange range) {
+        diags_.report(Diagnostic{
+            .severity = Severity::Error,
+            .stage = Stage::Lexer,
+            .code = std::string(code),
+            .message = std::move(message),
+            .range = range,
+        });
+    }
+
+    void skipWhitespaceAndComments() {
+        while (!atEnd()) {
+            const char c = peek();
+            if (isWhitespace(c)) {
+                advance();
+            } else if (c == '/' && peek(1) == '/') {
+                skipLineComment();
+            } else if (c == '/' && peek(1) == '*') {
+                skipBlockComment();
+            } else {
+                return;
+            }
+        }
+    }
+
+    void skipLineComment() {
+        while (!atEnd() && !isLineBreak(peek())) {
+            advance();
+        }
+    }
+
+    void skipBlockComment() {
+        beginToken();
+        advance();
+        advance();
+        while (!atEnd()) {
+            if (peek() == '*' && peek(1) == '/') {
+                advance();
+                advance();
+                return;
+            }
+            advance();
+        }
+        emitUnknown(kUnclosedComment,
+                    "незакрытый комментарий: ожидалось '*/', встретился конец файла");
+    }
+
+    void scanToken() {
+        beginToken();
+        const char c = peek();
+        if (isIdentifierStart(c)) {
+            scanWord();
+            return;
+        }
+        if (isDigit(c)) {
+            scanNumber();
+            return;
+        }
+        switch (c) {
+            case '{': case '}':
+                scanBrace(c);
+                return;
+            case '(': case ')': case '[': case ']':
+            case ';': case ':': case '.':
+                advance();
+                emit(TokenType::Delimiter);
+                return;
+            case '*': case '/': case '%': case ',':
+                advance();
+                emit(TokenType::Operator);
+                return;
+            case '+': case '-': scanOperator(c); return;
+            case '=': case '!': case '<': case '>': scanOperator('='); return;
+            case '&': case '|': scanDoubledOperator(c); return;
+            case '\'': case '"': scanQuoted(c); return;
+            case '`': scanPromptText(); return;
+            default:
+                scanInvalidCharacters();
+                return;
+        }
+    }
+
+    void scanBrace(char brace) {
+        if (!substitutions_.empty()) {
+            auto& depth = substitutions_.back().braceDepth;
+            if (brace == '{') {
+                ++depth;
+            } else if (depth > 0) {
+                --depth;
+            } else {
+                substitutions_.pop_back();
+                scanPromptText();
+                return;
+            }
+        }
+        advance();
+        emit(TokenType::Delimiter);
+    }
+
+    // Самая длинная лексема (LEX-6): первый символ, затем second, если он следует.
+    void scanOperator(char second) {
+        advance();
+        if (peek() == second) {
+            advance();
+        }
+        emit(TokenType::Operator);
+    }
+
+    // && и ||: одиночный символ операцией не является.
+    void scanDoubledOperator(char c) {
+        advance();
+        if (peek() == c) {
+            advance();
+            emit(TokenType::Operator);
+            return;
+        }
+        const std::string doubled(2, c);
+        emitUnknown(kIncompleteOperator, "неполная операция " + quoted(std::string(1, c)) +
+                                             ": ожидалось " + quoted(doubled));
+    }
+
+    // Максимальный идентификатор, по бору одновременно решается, ключевое ли это слово (LEX-3).
+    void scanWord() {
+        const KeywordTrie& trie = keywordTrie();
+        KeywordTrie::State state = KeywordTrie::kRoot;
+        while (!atEnd() && isIdentifierChar(peek())) {
+            state = trie.next(state, peek());
+            advance();
+        }
+        emit(trie.isWord(state) ? TokenType::Keyword : TokenType::Identifier);
+    }
+
+    void scanDigits() {
+        while (isDigit(peek())) {
+            advance();
+        }
+    }
+
+    bool dotBeforeDigit() const {
+        return peek() == '.' && isDigit(peek(1));
+    }
+
+    void malformedNumber(const std::string& reason) {
+        while (isIdentifierChar(peek()) || dotBeforeDigit()) {
+            advance();
+        }
+        emitUnknown(kMalformedNumber, "неверно записанное число " + quoted(currentText()) +
+                                          ": " + reason);
+    }
+
+    // INT или DOUBLE, затем необязательная единица измерения. Точка входит в число
+    // только перед цифрой, поэтому в выражении 3.x она остаётся разделителем.
+    void scanNumber() {
+        LiteralKind kind = LiteralKind::Int;
+        scanDigits();
+        if (dotBeforeDigit()) {
+            kind = LiteralKind::Double;
+            advance();
+            scanDigits();
+            if (dotBeforeDigit()) {
+                malformedNumber("после дробной части ожидался конец числа, встретилась вторая точка");
+                return;
+            }
+        }
+
+        if (peek() == 'e' || peek() == 'E') {
+            kind = LiteralKind::Double;
+            const char mark = peek();
+            advance();
+            if (peek() == '+' || peek() == '-') {
+                advance();
+            }
+            if (!isDigit(peek())) {
+                malformedNumber("после " + quoted(std::string(1, mark)) + " ожидались цифры порядка");
+                return;
+            }
+            scanDigits();
+            if (dotBeforeDigit()) {
+                malformedNumber("порядок должен быть целым, встретилась точка");
+                return;
+            }
+        }
+
+        if (isIdentifierStart(peek())) {
+            const std::size_t begin = pos_.offset;
+            while (isIdentifierChar(peek())) {
+                advance();
+            }
+            const auto unit = source_.substr(begin, pos_.offset - begin);
+            if (!isUnit(unit)) {
+                malformedNumber("ожидалась единица usd, tok, ktok, s или min, встретилось " +
+                                quoted(unit));
+                return;
+            }
+            if (dotBeforeDigit()) {
+                malformedNumber("после единицы ожидался конец числа, встретилась точка");
+                return;
+            }
+            kind = LiteralKind::Unit;
+        }
+
+        emit(TokenType::Literal, kind);
+    }
+
+    // CHAR в '...' и STRING в "...". Допустимы \n \r \t \\ и своя кавычка; перевод строки
+    // внутри запрещён. Если ошибок несколько, сообщается первая по важности:
+    // незакрытый литерал, затем escape-последовательность, затем длина CHAR.
+    void scanQuoted(char quote) {
+        const bool isChar = quote == '\'';
+        advance();
+
+        std::size_t characters = 0;
+        std::string badEscape;
+        while (true) {
+            if (atEnd() || isLineBreak(peek())) {
+                const std::string found = atEnd() ? "конец файла" : "перевод строки";
+                if (isChar) {
+                    emitUnknown(kUnclosedChar,
+                                "незакрытый символьный литерал: ожидалась закрывающая ', "
+                                "встретился " + found);
+                } else {
+                    emitUnknown(kUnclosedString,
+                                "незакрытая строка: ожидалась закрывающая \", встретился " + found);
+                }
+                return;
+            }
+            const char c = peek();
+            if (c == quote) {
+                advance();
+                break;
+            }
+            ++characters;
+            if (c != '\\') {
+                advance();
+                continue;
+            }
+            const std::size_t escapeBegin = pos_.offset;
+            advance();
+            if (atEnd() || isLineBreak(peek())) {
+                continue;
+            }
+            const char e = peek();
+            advance();
+            const bool valid = e == 'n' || e == 'r' || e == 't' || e == '\\' || e == quote;
+            if (!valid && badEscape.empty()) {
+                badEscape = source_.substr(escapeBegin, pos_.offset - escapeBegin);
+            }
+        }
+
+        if (!badEscape.empty()) {
+            emitUnknown(kInvalidEscape, "недопустимая escape-последовательность " +
+                                            quoted(badEscape) + ": ожидалось \\n, \\r, \\t, \\\\ или \\" +
+                                            std::string(1, quote));
+        } else if (isChar && characters != 1) {
+            emitUnknown(kCharLength,
+                        "символьный литерал: ожидался ровно один символ, встретилось символов: " +
+                            std::to_string(characters));
+        } else {
+            emit(TokenType::Literal, isChar ? LiteralKind::Char : LiteralKind::String);
+        }
+    }
+
+    // Текстовая часть промпта от ` или от } закрытой подстановки до ` (PROMPT_FULL или
+    // PROMPT_TAIL) или до ${ включительно (PROMPT_HEAD или PROMPT_MID), после которого лексер
+    // возвращается к обычным лексемам. Переводы строки в тексте допустимы; экранируются
+    // только \`, \\ и \${.
+    void scanPromptText() {
+        advance();
+        std::string badEscape;
+        while (!atEnd()) {
+            const char c = peek();
+            if (c == '`') {
+                advance();
+                finishPromptPart(badEscape);
+                return;
+            }
+            if (c == '$' && peek(1) == '{') {
+                advance();
+                advance();
+                finishPromptPart(badEscape);
+                substitutions_.push_back(Substitution{.opener = tokens_.size() - 1});
+                return;
+            }
+            if (c != '\\') {
+                advance();
+                continue;
+            }
+            const std::size_t escapeBegin = pos_.offset;
+            advance();
+            if (peek() == '`' || peek() == '\\') {
+                advance();
+            } else if (peek() == '$' && peek(1) == '{') {
+                advance();
+                advance();
+            } else if (!atEnd()) {
+                advance();
+                if (badEscape.empty()) {
+                    badEscape = source_.substr(escapeBegin, pos_.offset - escapeBegin);
+                }
+            }
+        }
+        emitUnknown(kUnclosedPrompt,
+                    "незакрытый промпт: ожидалась закрывающая `, встретился конец файла");
+    }
+
+    void finishPromptPart(const std::string& badEscape) {
+        if (badEscape.empty()) {
+            emit(TokenType::Literal, LiteralKind::Prompt);
+            return;
+        }
+        emitUnknown(kInvalidEscape, "недопустимая escape-последовательность " +
+                                        quoted(badEscape) + ": ожидалось \\`, \\\\ или \\${");
+    }
+
+    // Подстановка, не закрытая до конца файла, делает ошибочной открывшую её лексему.
+    void reportUnclosedSubstitutions() {
+        for (const Substitution& substitution : substitutions_) {
+            Token& opener = tokens_[substitution.opener];
+            opener.type = TokenType::Unknown;
+            opener.literal = LiteralKind::None;
+            reportError(kUnclosedSubstitution,
+                        "незакрытая подстановка в промпте: ожидалась '}', встретился конец файла",
+                        opener.range);
+        }
+        substitutions_.clear();
+    }
+
+    // Подряд идущие недопустимые символы дают одну лексему Unknown.
+    void scanInvalidCharacters() {
+        std::size_t count = 0;
+        do {
+            advance();
+            ++count;
+        } while (!atEnd() && !isWhitespace(peek()) && !startsToken(peek()));
+        const std::string text = quoted(currentText());
+        emitUnknown(kInvalidCharacter, count == 1 ? "недопустимый символ " + text
+                                                  : "недопустимые символы " + text);
+    }
+
+    std::string_view source_;
+    DiagnosticSink& diags_;
+    SourcePos pos_;
+    SourcePos start_;
+    std::vector<Token> tokens_;
+    std::vector<Substitution> substitutions_;
+};
+
+}  // namespace
+
+std::vector<Token> tokenize(std::string_view source, DiagnosticSink& diags) {
+    return Lexer(source, diags).run();
+}
+
+}  // namespace vibe

@@ -1,0 +1,33 @@
+struct Point { double x; double y; }
+enum State { Ready, Done }
+
+func int factorial(int n) {
+    if (n <= 1) return 1;
+    return n * factorial(n - 1);
+}
+
+func void main() {
+    int a = readInt();
+    int b = 3;
+    double ratio = 2.5;
+    bool ready = true;
+    char separator = ':';
+    string title = "Result";
+    map<int, int> values = map { 0: 1, 1: 2, 2: 3 };
+    map<string, int> counts = map { "ready": 1 };
+    Point p = Point { x: 0.5, y: ratio };
+    State s = State.Ready;
+    if (a > b) a = a - b;
+    else b = a;
+    a = b = 3;
+    for (int i = 0; i < 3; i++) {
+        if (i == 1) continue;
+        values[i] = factorial(i + 1);
+    }
+    while (a > 0) { a--; if (a == 1) break; }
+    do { ++a; } while (a < 2);
+    if (!ready) goto finish;
+    print((counts["ready"], values[2]));
+    print(p.x);
+    finish: print(title);
+}
